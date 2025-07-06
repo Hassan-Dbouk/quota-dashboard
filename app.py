@@ -52,12 +52,11 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # --- Auth Setup ---
-
+# os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "data-driven-attributes-957b43d1be08.json"
+# client = bigquery.Client()
 # --- Auth Setup ---
 credentials = service_account.Credentials.from_service_account_info(st.secrets["gcp_service_account"])
 client = bigquery.Client(credentials=credentials, project=credentials.project_id)
-# os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "data-driven-attributes-957b43d1be08.json"
-# client = bigquery.Client()
 
 # --- Loaders ---
 @st.cache_data(ttl=3600)
@@ -122,10 +121,38 @@ today = pd.to_datetime("today").normalize()
 this_year = today.year
 last_year = this_year - 1
 
-quarter = (today.month - 1) // 3 + 1
-quarter_start = datetime(this_year, 3 * (quarter - 1) + 1, 1)
-quarter_end = datetime(this_year, 3 * quarter, 1) + pd.offsets.MonthEnd(0)
+# quarter = (today.month - 1) // 3 + 1
+# quarter_start = datetime(this_year, 3 * (quarter - 1) + 1, 1)
+# Today's info
+today = pd.to_datetime("today").normalize()
+this_year = today.year
+last_year = this_year - 1
+
+# Current quarter calculation
+curr_quarter = (today.month - 1) // 3 + 1
+curr_quarter_start = datetime(this_year, 3 * (curr_quarter - 1) + 1, 1)
+
+# Check if it's within the first 9 days of the current quarter
+if (today - curr_quarter_start).days < 9:
+    # Use last quarter instead
+    if curr_quarter == 1:
+        quarter = 4
+        year_for_quarter = last_year
+    else:
+        quarter = curr_quarter - 1
+        year_for_quarter = this_year
+else:
+    # Use current quarter
+    quarter = curr_quarter
+    year_for_quarter = this_year
+
+# Final quarter start/end for selected quarter
+quarter_start = datetime(year_for_quarter, 3 * (quarter - 1) + 1, 1)
+quarter_end = datetime(year_for_quarter, 3 * quarter, 1) + pd.offsets.MonthEnd(0)
 quarter_months = [quarter_start.month + i for i in range(3)]
+
+# quarter_end = datetime(this_year, 3 * quarter, 1) + pd.offsets.MonthEnd(0)
+# quarter_months = [quarter_start.month + i for i in range(3)]
 
 # --- Plotting Functions ---
 def prepare_grouped(df, level, this_year, last_year, today):
@@ -204,6 +231,9 @@ def plot_chart(df, title, this_year, last_year, needed_avg, level, today, spend_
         #         )
         #     )
         if spend_series is not None and not spend_series.empty:
+            spend_series.index = spend_series.index.strftime('%d/%m')
+            spend_series = spend_series.reindex(df.index)
+            
             max_spend = spend_series.max()
             fig.add_trace(go.Scatter(
                 x=spend_series.index,
@@ -280,6 +310,31 @@ df_quotas = load_quotas()
 df_spend = load_spend()
 
 
+# def get_spend_timeseries(df_spend, nat, loc, start_date, end_date, level):
+
+
+#     df = df_spend[
+#         (df_spend["Nationality"] == nat) &
+#         (df_spend["Location"] == loc) &
+#         (df_spend["Day"] >= start_date) &
+#         (df_spend["Day"] <= end_date)
+#     ].copy()
+#     if df_spend.empty:
+#         return pd.Series(dtype='float64')
+#     df["Day"] = pd.to_datetime(df["Day"])
+
+#     if level == "D":
+#         df["period"] = df["Day"].dt.strftime('%d/%m')
+#     elif level == "W":
+#         df["period"] = df["Day"] - pd.to_timedelta(df["Day"].dt.weekday, unit="d")
+#         df["period"] = df["period"].dt.strftime('%d/%m')
+#     elif level == "M":
+#         df["period"] = df["Day"].dt.strftime('%b')
+#     else:
+#         raise ValueError("Invalid level")
+
+#     return df.groupby("period")["Spend"].sum()
+
 def get_spend_timeseries(df_spend, nat, loc, start_date, end_date, level):
     df = df_spend[
         (df_spend["Nationality"] == nat) &
@@ -287,19 +342,26 @@ def get_spend_timeseries(df_spend, nat, loc, start_date, end_date, level):
         (df_spend["Day"] >= start_date) &
         (df_spend["Day"] <= end_date)
     ].copy()
+
+    if df.empty:
+        return pd.Series(dtype='float64')
+
     df["Day"] = pd.to_datetime(df["Day"])
 
     if level == "D":
-        df["period"] = df["Day"].dt.strftime('%d/%m')
+        df["period"] = df["Day"]
     elif level == "W":
         df["period"] = df["Day"] - pd.to_timedelta(df["Day"].dt.weekday, unit="d")
-        df["period"] = df["period"].dt.strftime('%d/%m')
     elif level == "M":
-        df["period"] = df["Day"].dt.strftime('%b')
+        df["period"] = df["Day"].values.astype("datetime64[M]")
     else:
         raise ValueError("Invalid level")
 
-    return df.groupby("period")["Spend"].sum()
+    # ✅ Return a Series with datetime index
+    spend_series = df.groupby("period")["Spend"].sum().sort_index()
+
+    return spend_series
+
 
 
 col1, col2 = st.columns(2)
@@ -465,7 +527,7 @@ with col1:
         "CAC": [
         f"{cac_out:,.0f}<br>(BM: 35)",
         f"{cac_in:,.0f}<br>(BM: 3)",
-        f"{cac_pass:,.0f}"],  # Leave as-is for Passports (no benchmark)
+        f"{cac_pass:,.0f}<br>(ToSet BM)"],  # Leave as-is for Passports (no benchmark)
 
 
         "Forecast": [forecast_out, forecast_in, forecast_pass],
@@ -615,7 +677,7 @@ with col2:
         # "CAC": [cac_apps, cac_visas],
         "CAC": [
             f"{cac_apps:,.0f}<br>(BM: 5)",
-            f"{cac_visas:,.0f}"  # No benchmark for Visas
+            f"{cac_visas:,.0f}<br>(ToSet BM)"  # No benchmark for Visas
         ],
 
         "Forecast": [forecast_apps, forecast_visas],
