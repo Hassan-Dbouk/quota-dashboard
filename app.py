@@ -10,7 +10,6 @@ import json
 # --- Streamlit Config ---
 st.set_page_config(layout="wide")#
 
-
 st.markdown("""
     <style>
     /* Give more breathing space at top */
@@ -40,12 +39,6 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-
-
-
-
-
-
 st.markdown("""
     <style>
     h3 {
@@ -58,23 +51,13 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-
-
-
-
-
-
-
-
-
-
-
-
+# --- Auth Setup ---
 
 # --- Auth Setup ---
 credentials = service_account.Credentials.from_service_account_info(st.secrets["gcp_service_account"])
 client = bigquery.Client(credentials=credentials, project=credentials.project_id)
-
+# os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "data-driven-attributes-957b43d1be08.json"
+# client = bigquery.Client()
 
 # --- Loaders ---
 @st.cache_data(ttl=3600)
@@ -82,6 +65,7 @@ def load_applications():
     query = """
     SELECT
         SAFE.PARSE_DATE('%Y-%m-%d', SUBSTR(`Application Created`, 1, 10)) AS application_date,
+        SAFE.PARSE_DATE('%Y-%m-%d', SUBSTR(`Passport Sent`, 1, 10)) AS passport_date,
         `Nationality Category Updated` AS nationality,
         `Nationality Updated` AS nationality_raw,
         `Location Category Updated` AS location,
@@ -91,6 +75,7 @@ def load_applications():
     """
     return client.query(query).to_dataframe()
 
+
 @st.cache_data(ttl=3600)
 def load_quotas():
     query = """
@@ -98,10 +83,12 @@ def load_quotas():
         `Nationality Category Updated` AS nationality,
         `Location Category Updated` AS location,
         `Daily Quota Regardless Active Visas` AS quota_all,
-        `Daily Quota Considering Active Visas` AS quota_active
+        `Daily Quota Considering Active Visas` AS quota_active,
+        `Passports Daily Quota` AS quota_pass                
     FROM `data-driven-attributes.AT_marketing_db.ATD_Daily_Quotas`
     """
     return client.query(query).to_dataframe()
+
 
 @st.cache_data(ttl=3600)
 def load_spend():
@@ -175,7 +162,7 @@ def prepare_grouped(df, level, this_year, last_year, today):
 
     return pivoted
 
-def plot_chart(df, title, this_year, last_year, needed_avg, level, today):
+def plot_chart(df, title, this_year, last_year, needed_avg, level, today, spend_series=None):
     needed_avg = max(0, needed_avg)
     fig = go.Figure()
     if last_year in df.columns:
@@ -198,6 +185,46 @@ def plot_chart(df, title, this_year, last_year, needed_avg, level, today):
                 ticktext=list(df.index[::7])
             )
         )
+        # if spend_series is not None and not spend_series.empty:
+        #     fig.add_trace(go.Bar(
+        #         x=spend_series.index,
+        #         y=spend_series.values,
+        #         name="Spend (AED)",
+        #         yaxis="y2",
+        #         marker=dict(color="blue"),
+        #         opacity=0.4
+        #     ))
+
+        #     fig.update_layout(
+        #         yaxis2=dict(
+        #             title="Spend (AED)",
+        #             overlaying="y",
+        #             side="right",
+        #             showgrid=False,
+        #         )
+        #     )
+        if spend_series is not None and not spend_series.empty:
+            max_spend = spend_series.max()
+            fig.add_trace(go.Scatter(
+                x=spend_series.index,
+                y=spend_series.values,
+                name="Spend (AED)",
+                yaxis="y2",
+                line=dict(color="blue", width=1, dash="dot"),
+                mode='lines'
+            ))
+
+            fig.update_layout(
+                yaxis2=dict(
+                    title="Spend (AED)",
+                    overlaying="y",
+                    side="right",
+                    showgrid=False,
+                    range=[0, max_spend * 1.1] 
+                )
+            )
+
+
 
     st.plotly_chart(fig, use_container_width=True)
 
@@ -210,6 +237,7 @@ def calculate_wow(df):
     prev_end = start_period - timedelta(days=1)
     curr_count = df[(df["application_date"] >= start_period) & (df["application_date"] <= end_period)].shape[0]
     prev_count = df[(df["application_date"] >= prev_start) & (df["application_date"] <= prev_end)].shape[0]
+    print(f"Current: {curr_count}, Previous: {prev_count}")  # Debug line
     if prev_count == 0:
         return float('nan')
     return ((curr_count - prev_count) / prev_count) * 100
@@ -252,6 +280,28 @@ df_quotas = load_quotas()
 df_spend = load_spend()
 
 
+def get_spend_timeseries(df_spend, nat, loc, start_date, end_date, level):
+    df = df_spend[
+        (df_spend["Nationality"] == nat) &
+        (df_spend["Location"] == loc) &
+        (df_spend["Day"] >= start_date) &
+        (df_spend["Day"] <= end_date)
+    ].copy()
+    df["Day"] = pd.to_datetime(df["Day"])
+
+    if level == "D":
+        df["period"] = df["Day"].dt.strftime('%d/%m')
+    elif level == "W":
+        df["period"] = df["Day"] - pd.to_timedelta(df["Day"].dt.weekday, unit="d")
+        df["period"] = df["period"].dt.strftime('%d/%m')
+    elif level == "M":
+        df["period"] = df["Day"].dt.strftime('%b')
+    else:
+        raise ValueError("Invalid level")
+
+    return df.groupby("period")["Spend"].sum()
+
+
 col1, col2 = st.columns(2)
 
 with col1:
@@ -290,9 +340,8 @@ with col1:
     yoy_in = calculate_yoy(df_inside)
 
     df_plot_out = prepare_grouped(df_outside_q, selected_level, this_year, last_year, today)
-    plot_chart(df_plot_out, "Filipina - Outside UAE", this_year, last_year, needed_avg_out, selected_level, today)
-
-    # st.markdown("#### Filipinas Inside & Outside UAE Summary")    
+    spend_out_series = get_spend_timeseries(df_spend, "filipina", "outside_uae", quarter_start.date(), quarter_end.date(), selected_level)
+    plot_chart(df_plot_out, "Filipina - Outside UAE", this_year, last_year, needed_avg_out, selected_level, today, spend_out_series)  
 
     # --- Define date range for spend filtering ---
     start_date = quarter_start.date()
@@ -319,26 +368,127 @@ with col1:
 
     cac_in = spend_in / attained_in if attained_in else 0
 
+    # --- OUTAE Passports Section ---
+    df_out_pass = df_outside.copy()
+    df_out_pass["passport_date"] = pd.to_datetime(df_out_pass["passport_date"], errors="coerce")
+    df_out_pass_q = df_out_pass[
+        (df_out_pass["application_date"].dt.month.isin(quarter_months)) &
+        (df_out_pass["application_date"].dt.year == this_year)
+    ]
+
+    # Count rows where passport was sent (i.e., passport_date is not null)
+    delivered_pass = df_out_pass_q["passport_date"].notna().sum()
+
+    # Passport quota
+    daily_quota_pass = df_quotas.loc[
+        (df_quotas["nationality"] == "filipina") & (df_quotas["location"] == "outside_uae"),
+        "quota_pass"
+    ].iloc[0]
+    total_quota_pass = daily_quota_pass * ((quarter_end - quarter_start).days + 1)
+
+    # Forecasting
+    days_so_far_pass = (today - quarter_start).days
+    remaining_days_pass = (quarter_end - today).days
+    avg_so_far_pass = delivered_pass / days_so_far_pass if days_so_far_pass > 0 else 0
+    forecast_pass = delivered_pass + (avg_so_far_pass * remaining_days_pass)
+
+    # CAC
+    cac_pass = spend_out / delivered_pass if delivered_pass else 0
+
+    # Trends
+    # def calculate_passport_metric(metric_func):
+    #     try:
+    #         return metric_func(df_out_pass.rename(columns={"passport_date": "application_date"}))
+    #     except:
+    #         return float('nan')
+    def calculate_passport_trend(df_applications, metric_func):
+        try:
+            df = df_applications.copy()
+            df["application_date"] = pd.to_datetime(df["application_date"], errors="coerce")
+            df = df[df["passport_date"].notna()]  # Only those who delivered passports
+            return metric_func(df)
+        except:
+            return float("nan")
+
+
+    # wow_pass = calculate_passport_metric(calculate_wow)
+    # mom_pass = calculate_passport_metric(calculate_mom)
+    # yoy_pass = calculate_passport_metric(calculate_yoy)
+
+    wow_pass = calculate_passport_trend(df_out_pass, calculate_wow)
+    mom_pass = calculate_passport_trend(df_out_pass, calculate_mom)
+    yoy_pass = calculate_passport_trend(df_out_pass, calculate_yoy)
+
+
+
+
+    #############
+    # Daily averages
+    quota_out_daily = total_quota_out / ((quarter_end - quarter_start).days + 1)
+    quota_in_daily = total_quota_in / ((quarter_end - quarter_start).days + 1)
+    quota_pass_daily = total_quota_pass / ((quarter_end - quarter_start).days + 1)
+
+    attained_out_daily = attained_out / days_so_far_out if days_so_far_out else 0
+    attained_in_daily = attained_in / days_so_far_in if days_so_far_in else 0
+    delivered_pass_daily = delivered_pass / days_so_far_pass if days_so_far_pass else 0
+
+    forecast_out_daily = avg_so_far_out
+    forecast_in_daily = avg_so_far_in
+    forecast_pass_daily = avg_so_far_pass
+    #############
+
 
     table_df = pd.DataFrame({
-        "Segment": ["OUTAE Apps", "INUAE Apps"],
-        "Quota": [total_quota_out, total_quota_in],
-        "Delivered": [attained_out, attained_in],
-        "%D": [attained_out / total_quota_out * 100, attained_in / total_quota_in * 100],
-        "CAC": [cac_out, cac_in],
-        "Forecast": [forecast_out, forecast_in],
-        "%F": [forecast_out / total_quota_out * 100, forecast_in / total_quota_in * 100],
-        "WoW": [wow_out, wow_in],
-        "MoM": [mom_out, mom_in],
-        "YoY": [yoy_out, yoy_in]
+        "Segment": ["OUTAE Apps", "INUAE Apps", "OUTAE Pass"],
+        # "Quota": [total_quota_out, total_quota_in, total_quota_pass],
+        "Quota": [
+            f"{int(total_quota_out):,}<br>({round(quota_out_daily)}/day)",
+            f"{int(total_quota_in):,}<br>({round(quota_in_daily)}/day)",
+            f"{int(total_quota_pass):,}<br>({round(quota_pass_daily)}/day)"
+        ],
+
+
+
+        # "Delivered": [attained_out, attained_in, delivered_pass],
+        "Delivered": [
+            f"{int(attained_out):,}<br>({round(attained_out_daily)}/day)",
+            f"{int(attained_in):,}<br>({round(attained_in_daily)}/day)",
+            f"{int(delivered_pass):,}<br>({round(delivered_pass_daily)}/day)"
+        ],      
+
+        "%D": [
+            attained_out / total_quota_out * 100,
+            attained_in / total_quota_in * 100,
+            delivered_pass / total_quota_pass * 100 if total_quota_pass else 0
+        ],
+        # "CAC": [cac_out, cac_in, cac_pass],
+        "CAC": [
+        f"{cac_out:,.0f}<br>(BM: 35)",
+        f"{cac_in:,.0f}<br>(BM: 3)",
+        f"{cac_pass:,.0f}"],  # Leave as-is for Passports (no benchmark)
+
+
+        "Forecast": [forecast_out, forecast_in, forecast_pass],
+
+
+        "%F": [
+            forecast_out / total_quota_out * 100,
+            forecast_in / total_quota_in * 100,
+            forecast_pass / total_quota_pass * 100 if total_quota_pass else 0
+        ],
+        "WoW": [wow_out, wow_in, wow_pass],
+        "MoM": [mom_out, mom_in, mom_pass],
+        "YoY": [yoy_out, yoy_in, yoy_pass]
     })
+
 
     # --- Format table manually ---
     formatted_table_df = table_df.copy()
     percent_cols = ["%D", "%F", "WoW", "MoM", "YoY"]
 
     # Format integer columns with comma separator
-    for col in ["Quota", "Delivered", "Forecast", "CAC"]:
+    for col in [ "Forecast"]:
+        
         formatted_table_df[col] = formatted_table_df[col].apply(lambda x: f"{x:,.0f}")
 
     # Format percent columns with % and no decimals
@@ -353,7 +503,8 @@ with col1:
             index=False,
             justify="center",
             border=0,
-            classes="centered-table"
+            classes="centered-table",
+            escape=False
         ),
         unsafe_allow_html=True
     )
@@ -390,7 +541,9 @@ with col2:
     needed_avg_ph = max(0, (total_quota_ph - attained_ph) / remaining_days_ph) if remaining_days_ph > 0 else 0
 
     df_plot_ph = prepare_grouped(df_phil_q, selected_level, this_year, last_year, today)
-    plot_chart(df_plot_ph, "Filipina - Philippines (Active Visas)", this_year, last_year, needed_avg_ph, selected_level, today)
+    spend_ph_series = get_spend_timeseries(df_spend, "filipina", "philippines", quarter_start.date(), quarter_end.date(), selected_level)
+    plot_chart(df_plot_ph, "Filipina - Philippines (Active Visas)", this_year, last_year, needed_avg_ph, selected_level, today, spend_ph_series)
+
 
     st.markdown("#### Philippines Summary")
     start_date = quarter_start.date()
@@ -436,22 +589,43 @@ with col2:
     cac_visas = spend_ph / visas_ph if visas_ph else 0
 
     # --- Table Build ---
+    # Daily values for display
+    quota_apps_daily = total_quota_apps / ((quarter_end - quarter_start).days + 1)
+    quota_visas_daily = total_quota_visas / ((quarter_end - quarter_start).days + 1)
+    apps_daily = apps_ph / days_so_far_apps if days_so_far_apps else 0
+    visas_daily = visas_ph / days_so_far_visas if days_so_far_visas else 0
+
     philippines_table = pd.DataFrame({
         "Segment": ["Apps", "Visas"],
-        "Quota": [total_quota_apps, total_quota_visas],
-        "Delivered": [apps_ph, visas_ph],
+        # "Quota": [total_quota_apps, total_quota_visas],
+        "Quota": [
+            f"{int(total_quota_apps):,}<br>({round(quota_apps_daily)}/day)",
+            f"{int(total_quota_visas):,}<br>({round(quota_visas_daily)}/day)"
+        ],
+
+        # "Delivered": [apps_ph, visas_ph],
+        "Delivered": [
+            f"{int(apps_ph):,}<br>({round(apps_daily)}/day)",
+            f"{int(visas_ph):,}<br>({round(visas_daily)}/day)"
+        ],
         "%D": [
             apps_ph / total_quota_apps * 100 if total_quota_apps else 0,
             visas_ph / total_quota_visas * 100 if total_quota_visas else 0
         ],
-        "CAC": [cac_apps, cac_visas],
+        # "CAC": [cac_apps, cac_visas],
+        "CAC": [
+            f"{cac_apps:,.0f}<br>(BM: 5)",
+            f"{cac_visas:,.0f}"  # No benchmark for Visas
+        ],
+
         "Forecast": [forecast_apps, forecast_visas],
         "%F": [
             forecast_apps / total_quota_apps * 100 if total_quota_apps else 0,
             forecast_visas / total_quota_visas * 100 if total_quota_visas else 0
         ],
-        "WoW": [calculate_wow(df_phil_all_q), calculate_wow(df_phil_visas_q)],
-        "MoM": [calculate_mom(df_phil_all_q), calculate_mom(df_phil_visas_q)],
+        # "WoW": [calculate_wow(df_phil_all_q), calculate_wow(df_phil_visas_q)],
+        "WoW": [calculate_wow(df_phil_all), calculate_wow(df_phil[df_phil["active_visa_status"] == "true"])],
+        "MoM": [calculate_mom(df_phil_all), calculate_mom(df_phil[df_phil["active_visa_status"] == "true"])],
         "YoY": [calculate_yoy(df_phil_all_q), calculate_yoy(df_phil_visas_q)],
     })
 
@@ -460,7 +634,7 @@ with col2:
     formatted_philippines_table = philippines_table.copy()
     percent_cols = ["%D", "%F", "WoW", "MoM", "YoY"]
 
-    for col in ["Quota", "Delivered", "Forecast", "CAC"]:
+    for col in ["Forecast"]:
         formatted_philippines_table[col] = formatted_philippines_table[col].apply(lambda x: f"{x:,.0f}")
     for col in percent_cols:
         formatted_philippines_table[col] = formatted_philippines_table[col].apply(lambda x: f"{x:.0f}%" if pd.notnull(x) else "")
@@ -470,7 +644,8 @@ with col2:
             index=False,
             justify="center",
             border=0,
-            classes="centered-table"
+            classes="centered-table",
+            escape= False
         ),
         unsafe_allow_html=True
     )
@@ -488,6 +663,9 @@ def compute_metrics(df, quotas, nationality_value, nationality_filter, location,
     remaining_days = (quarter_end - today).days
     needed_avg = max(0, (total_quota - attained) / remaining_days) if remaining_days > 0 else 0
     days_so_far = (today - quarter_start).days
+    quota_daily = total_quota / ((quarter_end - quarter_start).days + 1)
+    attained_daily = attained / days_so_far if days_so_far > 0 else 0
+
     avg_so_far = attained / days_so_far if days_so_far > 0 else 0
     forecast = attained + (avg_so_far * remaining_days)
 
@@ -508,8 +686,10 @@ def compute_metrics(df, quotas, nationality_value, nationality_filter, location,
 
     return {
         "Segment": label,
-        "Quota": total_quota,
-        "Delivered": attained,
+        # "Quota": total_quota,
+        "Quota": f"{int(total_quota):,}<br>({round(quota_daily)}/day)",
+        "Delivered": f"{int(attained):,}<br>({round(attained_daily)}/day)",
+        # "Delivered": attained,
         "%D": attained / total_quota * 100 if total_quota else 0,
         "CAC": cac,
         "Forecast": forecast,
@@ -519,12 +699,6 @@ def compute_metrics(df, quotas, nationality_value, nationality_filter, location,
         "YoY": yoy,
     }
 
-
-
-
-
-# Your code is correct, but it breaks because of the column name mismatches.
-# Here's the fixed version you should paste at the end of your current script (or use this updated script instead):
 
 segments = [
     compute_metrics(
@@ -553,22 +727,20 @@ df_afro = pd.DataFrame(segments)
 formatted_afro = df_afro.copy()
 percent_cols = ["%D", "%F", "WoW", "MoM", "YoY"]
 
-for col in ["Quota", "Delivered", "Forecast", "CAC"]:
+for col in ["Forecast", "CAC"]:
     formatted_afro[col] = formatted_afro[col].apply(lambda x: f"{x:,.0f}")
 # Format CAC with 1 decimal
 formatted_afro["CAC"] = df_afro["CAC"].apply(lambda x: f"{x:,.1f}")
 for col in percent_cols:
     formatted_afro[col] = formatted_afro[col].apply(lambda x: f"{x:.0f}%" if pd.notnull(x) else "")
 
-
-
-
 st.markdown(
     formatted_afro.to_html(
         index=False,
         justify="center",
         border=0,
-        classes="centered-table"
+        classes="centered-table",
+        escape=False
     ),
     unsafe_allow_html=True
 )
@@ -591,3 +763,21 @@ st.markdown("""
     }
     </style>
 """, unsafe_allow_html=True)
+
+
+
+
+def calculate_wow(df):
+    df = df[df["application_date"].notna()]
+    end_period = today - timedelta(days=1)
+    start_period = end_period - timedelta(days=6)
+    prev_start = start_period - timedelta(days=7)
+    prev_end = start_period - timedelta(days=1)
+    curr_count = df[(df["application_date"] >= start_period) & (df["application_date"] <= end_period)].shape[0]
+    prev_count = df[(df["application_date"] >= prev_start) & (df["application_date"] <= prev_end)].shape[0]
+    
+    print(f"Current: {curr_count}, Previous: {prev_count}")  # Debug line
+
+    if prev_count == 0:
+        return float('nan')
+    return ((curr_count - prev_count) / prev_count) * 100
