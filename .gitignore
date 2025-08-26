@@ -1,0 +1,19 @@
+# Google Cloud credentials
+*.json
+data-driven-attributes-*.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Streamlit
+.streamlit/
+
+# Environment variables
+.env
+.venv/
+venv/
